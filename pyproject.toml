@@ -23,3 +23,6 @@ dependencies = [
 [project.urls]
 homepage = "https://github.com/okumakito/elapy"
 repository = "https://github.com/okumakito/elapy"
+
+[tool.setuptools]
+packages = ["elapy"]
