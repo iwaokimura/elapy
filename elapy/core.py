@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 from scipy.cluster.hierarchy import distance
+from numba import njit
 
 # Notations
 # W: weight matrix
@@ -20,14 +21,24 @@ def load_testdata(n=1):
 def binarize(X):
   return ((X.T - X.T.mean()).T >=0).astype(int)
 
-def calc_state_no(X):
+def calc_state_no_old(X):
   return X.astype(str).sum().apply(lambda x:int(x,base=2))
 
-def gen_all_state(X_in):
-    n = len(X_in)
-    X =  np.array([list(bin(i)[2:].rjust(n,'0'))
-                for i in range(2**n)]).astype(int).T
-    return pd.DataFrame(X, index=X_in.index)
+def calc_state_no(X):
+    # X: shape (n, m) の numpy.ndarray
+    if isinstance(X, pd.DataFrame):
+        X = X.values
+    # 各列を2進数文字列に変換し、10進数に変換
+    bin_strs = [''.join(str(bit) for bit in X[:, i]) for i in range(X.shape[1])]
+    return np.array([int(b, 2) for b in bin_strs])
+
+@njit
+def gen_all_state(n):
+    X = np.zeros((n, 2**n), dtype=np.int32)
+    for i in range(2**n):
+        for j in range(n):
+            X[j, i] = (i >> (n-j-1)) & 1
+    return X
 
 def calc_energy(h, W, X_in):
   X = 2*X_in-1
@@ -63,7 +74,10 @@ def fit_approx(X_in, max_iter=10**3, alpha=0.9):
 # likelihood
 def fit_exact(X_in, max_iter=10**4, alpha=0.5):
   X      = 2*X_in-1
-  X_all  = gen_all_state(X)
+  if isinstance(X, pd.DataFrame):
+      X = X.values  # DataFrameをndarrayに変換
+  n, k   = X.shape
+  X_all  = gen_all_state(n)
   X2_all = 2*X_all-1
   n, k   = X.shape
   m      = 2**n
@@ -71,23 +85,24 @@ def fit_exact(X_in, max_iter=10**4, alpha=0.5):
   W      = np.zeros((n,n))
   X_mean = X.mean(axis=1)
   X_corr = X.dot(X.T) / k
-  np.fill_diagonal(X_corr.values, 0)
+  np.fill_diagonal(X_corr, 0)
   for i in range(max_iter):
     p      = calc_prob(h, W, X_all)
     Y_mean = X2_all.dot(p)
     Y_corr = X2_all.dot(np.diag(p)).dot(X2_all.T)
-    np.fill_diagonal(Y_corr.values, 0)
+    np.fill_diagonal(Y_corr, 0)
     h += alpha * (X_mean - Y_mean)
     W += alpha * (X_corr - Y_corr)
     if np.allclose(X_mean, Y_mean) and np.allclose(X_corr, Y_corr):
       break
   return h, W
 
-def calc_accuracy(h, W, X):
+def calc_accuracy_old(h, W, X):
   freq  = calc_state_no(X).value_counts()
   p_n   = freq / freq.sum()
   q     = X.mean(axis=1)
-  X_all = gen_all_state(X)
+  n, k = X.shape
+  X_all = gen_all_state(n)
   p_1   = (X_all.T * q + (1-X_all).T * (1-q)).T.prod()
   p_2   = calc_prob(h, W, X_all)
   def entropy(p):
@@ -98,20 +113,55 @@ def calc_accuracy(h, W, X):
   acc2  = (d1-d2)/d1
   return acc1, acc2
 
-def calc_adjacent(X):
-  X_all = gen_all_state(X)
+def calc_accuracy(h, W, X):
+    freq  = pd.Series(calc_state_no(X)).value_counts()
+    p_n   = freq / freq.sum()
+    q     = X.mean(axis=1).to_numpy()  # ← ndarray化
+    n, k = X.shape
+    X_all = gen_all_state(n)
+    # p_1の計算をnumpyで
+    p_1 = np.prod(X_all * q[:, None] + (1 - X_all) * (1 - q[:, None]), axis=0)
+    p_2 = calc_prob(h, W, X_all)
+    def entropy(p):
+        return (-p * np.log2(p)).sum()
+    # p_n, p_1, p_2のインデックス合わせ
+    idx = freq.index
+    acc1 = (entropy(p_1[idx]) - entropy(p_2[idx])) / (entropy(p_1[idx]) - entropy(p_n))
+    d1   = (p_n * np.log2(p_n / p_1[idx])).sum()
+    d2   = (p_n * np.log2(p_n / p_2[idx])).sum()
+    acc2  = (d1-d2)/d1
+    return acc1, acc2
+
+def calc_adjacent_old(X):
+  if isinstance(X, pd.DataFrame):
+      X = X.values
+  n, k = X.shape
+  X_all = gen_all_state(n)
   out_list = [calc_state_no(X_all)]
-  for i in X_all.index:
+  for i in range(X_all.shape[0]):
     Y = X_all.copy()
-    Y.loc[i] = 1 - Y.loc[i]
+    Y[i] = 1 - Y[i]
     out_list.append(calc_state_no(Y))
   return pd.concat(out_list, axis=1)
 
+def calc_adjacent(X):
+  n, k = X.shape
+  X_all = gen_all_state(n)
+  out_list = [pd.Series(calc_state_no(X_all))]
+  for i in range(X_all.shape[1]):
+      Y = X_all.copy()
+      Y[:, i] = 1 - Y[:, i]
+      out_list.append(pd.Series(calc_state_no(Y)))
+  return pd.concat(out_list, axis=1)
+
 def calc_basin_graph(h, W, X):
-  X_all = gen_all_state(X)
+  if isinstance(X, pd.DataFrame):
+      X = X.values
+  n, k = X.shape
+  X_all = gen_all_state(n)
   A = calc_adjacent(X)
   energy = calc_energy(h, W, X_all)
-  min_idx = energy.values[A].argmin(axis=1)
+  min_idx = energy[A].argmin(axis=1)
   graph = pd.DataFrame()
   graph['source'] = A.index.values
   graph['target'] = A.values[A.index, min_idx]
@@ -161,9 +211,12 @@ def calc_discon_graph_sub(i_input, H, A):
   return C
 
 def calc_discon_graph(h, W, X, graph):
-  X_all = gen_all_state(X)
+  if isinstance(X, pd.DataFrame):
+      X = X.values
+  n, k = X.shape
+  X_all = gen_all_state(n)
   A = calc_adjacent(X).values[:, 1:]  # remove self-loop
-  H = calc_energy(h, W, X_all).values
+  H = calc_energy(h, W, X_all)
   df = graph[graph.source==graph.target]
   local_idx = df.index
   out_list = []
@@ -188,16 +241,17 @@ def uniform_layout(G, alpha=0.1, n_iter=None, seed=None, **kwargs):
   return dict(zip(pos.keys(), X))
 
 def calc_trans_bm(h, W, X):
-  X_all  = gen_all_state(X)
-  X2_all = 2 * X_all - 1
-  Y      = W.dot(X2_all).T + h
-  Q      = 1/(1+np.exp(-Y))
-  out_list = []
-  for _, q in Q.iterrows():
-    p = (X_all.T * q + (1-X_all).T * (1-q)).T.prod()
-    out_list.append(p)
-  P = pd.concat(out_list, axis=1)  # index: dst, col: src
-  return P
+    n, k = X.shape
+    X_all = gen_all_state(n)
+    X2_all = 2 * X_all - 1
+    Y = (W @ X2_all).T + h  # shape: (m, n)
+    Q = 1 / (1 + np.exp(-Y))  # shape: (m, n)
+    out_list = []
+    for q in Q:  # q: shape (n,)
+        p = np.prod(X_all.T * q + (1 - X_all).T * (1 - q), axis=1)
+        out_list.append(pd.Series(p))
+    P = pd.concat(out_list, axis=1)  # index: dst, col: src
+    return P
 
 def calc_depth_threshold(n, k, n_repeat=100, method='exact', alpha=0.05):
   np.random.seed(12345)
